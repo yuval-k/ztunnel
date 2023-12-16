@@ -102,6 +102,9 @@ pub fn handle_single_resource<T: prost::Message, F: FnMut(XdsUpdate<T>) -> anyho
 // Handler is responsible for handling a discovery response.
 // Handlers can mutate state and return a list of rejected configurations (if there are any).
 pub trait Handler<T: prost::Message>: Send + Sync + 'static {
+    fn no_on_demand(&self) -> bool {
+        false
+    }
     fn handle(&self, res: Vec<XdsUpdate<T>>) -> Result<(), Vec<RejectedConfig>>;
 }
 
@@ -128,25 +131,45 @@ impl<T: 'static + prost::Message + Default> RawHandler for HandlerWrapper<T> {
         res: DeltaDiscoveryResponse,
     ) -> Result<(), Vec<RejectedConfig>> {
         let type_url = res.type_url.clone();
-        let removes = state.handle_removes(&res);
-        let updates: Vec<XdsUpdate<T>> = res
-            .resources
+        let removes = &res.removed_resources;
+
+        let resources = &res.resources;
+        let updates: Vec<XdsUpdate<T>> = resources
             .into_iter()
-            .map(|r| {
-                let key = ResourceKey {
-                    name: r.name.clone(),
-                    type_url: type_url.clone(),
-                };
-                state.notify_on_demand(&key);
-                state.add_resource(key.type_url, key.name);
-                r
-            })
             .map(|raw| decode_proto::<T>(raw).unwrap())
             .map(XdsUpdate::Update)
-            .chain(removes.into_iter().map(XdsUpdate::Remove))
+            .chain(removes.iter().map(|e| e.clone()).map(XdsUpdate::Remove))
             .collect();
 
-        self.h.handle(updates)
+        // First call handlers that update the proxy state.
+        // other wise on-demand notifications might observe a cache without their resource
+        let result = self.h.handle(updates);
+
+        // after we update the proxy cache, we can update our xds cache. it's important that we do this after
+        // as we make on demand notifications here, so the proxy cache must be updated first.
+
+        for name in res.removed_resources {
+            let k = ResourceKey {
+                name: name,
+                type_url: res.type_url.clone(),
+            };
+            debug!("received delete resource {k}");
+            if let Some(rm) = state.known_resources.get_mut(&res.type_url) {
+                rm.remove(&k.name);
+            }
+            state.notify_on_demand(&k);
+        }
+
+        for r in resources {
+            let key = ResourceKey {
+                name: r.name.clone(),
+                type_url: type_url.clone(),
+            };
+            state.notify_on_demand(&key);
+            state.add_resource(key.type_url, key.name);
+        }
+
+        result
     }
 }
 
@@ -156,7 +179,7 @@ pub struct Config {
     auth: identity::AuthSource,
     proxy_metadata: HashMap<String, String>,
     handlers: HashMap<String, Box<dyn RawHandler>>,
-    initial_watches: Vec<String>,
+    initial_requests: Vec<DeltaDiscoveryRequest>,
     on_demand: bool,
 }
 
@@ -186,23 +209,6 @@ impl State {
             .or_default()
             .insert(name.clone());
     }
-    fn handle_removes(&mut self, resp: &DeltaDiscoveryResponse) -> Vec<String> {
-        resp.removed_resources
-            .iter()
-            .map(|res| {
-                let k = ResourceKey {
-                    name: res.to_owned(),
-                    type_url: resp.type_url.clone(),
-                };
-                debug!("received delete resource {k}");
-                if let Some(rm) = self.known_resources.get_mut(&resp.type_url) {
-                    rm.remove(&k.name);
-                }
-                self.notify_on_demand(&k);
-                k.name
-            })
-            .collect()
-    }
 }
 
 impl Config {
@@ -215,7 +221,7 @@ impl Config {
             tls_builder,
             auth: config.auth,
             handlers: HashMap::new(),
-            initial_watches: Vec::new(),
+            initial_requests: Vec::new(),
             on_demand: config.xds_on_demand,
             proxy_metadata: config.proxy_metadata,
         }
@@ -226,10 +232,12 @@ impl Config {
         F: 'static + prost::Message + Default,
     {
         let type_url = type_url.into();
-        self.with_handler(type_url.clone(), f).watch(type_url)
+        let no_on_demand = f.no_on_demand();
+        self.with_handler(type_url.clone(), f)
+            .watch(type_url, no_on_demand)
     }
 
-    pub fn with_handler<F>(mut self, type_url: impl Into<String>, f: impl Handler<F>) -> Config
+    fn with_handler<F>(mut self, type_url: impl Into<String>, f: impl Handler<F>) -> Config
     where
         F: 'static + prost::Message + Default,
     {
@@ -238,9 +246,112 @@ impl Config {
         self
     }
 
-    pub fn watch(mut self, type_url: impl Into<String>) -> Config {
-        self.initial_watches.push(type_url.into());
+    fn watch(mut self, type_url: impl Into<String>, no_on_demand: bool) -> Config {
+        self.initial_requests
+            .push(self.construct_initial_request(&type_url.into(), no_on_demand));
         self
+    }
+
+    fn build_struct<T: IntoIterator<Item = (S, S)>, S: ToString>(a: T) -> Struct {
+        let fields = BTreeMap::from_iter(a.into_iter().map(|(k, v)| {
+            (
+                k.to_string(),
+                Value {
+                    kind: Some(Kind::StringValue(v.to_string())),
+                },
+            )
+        }));
+        Struct { fields }
+    }
+
+    fn json_to_struct(json: serde_json::Map<String, serde_json::Value>) -> prost_types::Struct {
+        prost_types::Struct {
+            fields: json
+                .into_iter()
+                .map(|(k, v)| (k, Self::json_to_value(v)))
+                .collect(),
+        }
+    }
+
+    fn json_to_value(json: serde_json::Value) -> prost_types::Value {
+        use prost_types::value::Kind::*;
+        use serde_json::Value::*;
+
+        prost_types::Value {
+            kind: Some(match json {
+                Null => NullValue(0),
+                Bool(v) => BoolValue(v),
+                Number(n) => NumberValue(n.as_f64().unwrap_or_else(|| {
+                    error!("error parsing JSON number: {}", n);
+                    0f64
+                })),
+                String(s) => StringValue(s),
+                Array(v) => ListValue(prost_types::ListValue {
+                    values: v.into_iter().map(Self::json_to_value).collect(),
+                }),
+                Object(v) => StructValue(Self::json_to_struct(v)),
+            }),
+        }
+    }
+    fn node(&self) -> Node {
+        let ip = std::env::var(INSTANCE_IP);
+        let ip = ip.as_deref().unwrap_or(DEFAULT_IP);
+        let pod_name = std::env::var(POD_NAME);
+        let pod_name = pod_name.as_deref().unwrap_or(EMPTY_STR);
+        let ns = std::env::var(POD_NAMESPACE);
+        let ns = ns.as_deref().unwrap_or(EMPTY_STR);
+        let node_name = std::env::var(NODE_NAME);
+        let node_name = node_name.as_deref().unwrap_or(EMPTY_STR);
+        let mut metadata = Self::build_struct([
+            (NAME, pod_name),
+            (NAMESPACE, ns),
+            (INSTANCE_IPS, ip),
+            (NODE_NAME, node_name),
+        ]);
+        metadata
+            .fields
+            .append(&mut Self::build_struct(self.proxy_metadata.clone()).fields);
+
+        // Lookup ISTIO_METAJSON_* environment variables and add them to the node metadata
+        for (key, val) in std::env::vars().filter(|(key, _)| key.starts_with(ISTIO_METAJSON_PREFIX))
+        {
+            if let Ok(v) = serde_json::from_str(&val) {
+                metadata.fields.insert(
+                    key.trim_start_matches(ISTIO_METAJSON_PREFIX).to_string(),
+                    Self::json_to_value(v),
+                );
+            } else {
+                error!("failed to parse {}={}", key, val);
+            }
+        }
+
+        Node {
+            id: format!("ztunnel~{ip}~{pod_name}.{ns}~{ns}.svc.cluster.local"),
+            metadata: Some(metadata),
+            ..Default::default()
+        }
+    }
+    fn construct_initial_request(
+        &self,
+        request_type: &str,
+        no_on_demand: bool,
+    ) -> DeltaDiscoveryRequest {
+        let node = self.node();
+
+        let (sub, unsub) = if (!no_on_demand) && self.on_demand {
+            // XDS doesn't have a way to subscribe to zero resources. We workaround this by subscribing and unsubscribing
+            // in one event, effectively giving us "subscribe to nothing".
+            (vec!["*".to_string()], vec!["*".to_string()])
+        } else {
+            (vec![], vec![])
+        };
+        DeltaDiscoveryRequest {
+            type_url: request_type.to_owned(),
+            node: Some(node.clone()),
+            resource_names_subscribe: sub,
+            resource_names_unsubscribe: unsub,
+            ..Default::default()
+        }
     }
 
     pub fn build(self, metrics: Metrics, block_ready: readiness::BlockReady) -> AdsClient {
@@ -420,91 +531,38 @@ impl AdsClient {
         }
     }
 
-    fn build_struct<T: IntoIterator<Item = (S, S)>, S: ToString>(a: T) -> Struct {
-        let fields = BTreeMap::from_iter(a.into_iter().map(|(k, v)| {
-            (
-                k.to_string(),
-                Value {
-                    kind: Some(Kind::StringValue(v.to_string())),
-                },
-            )
-        }));
-        Struct { fields }
-    }
-
-    fn json_to_struct(json: serde_json::Map<String, serde_json::Value>) -> prost_types::Struct {
-        prost_types::Struct {
-            fields: json
-                .into_iter()
-                .map(|(k, v)| (k, Self::json_to_value(v)))
-                .collect(),
-        }
-    }
-
-    fn json_to_value(json: serde_json::Value) -> prost_types::Value {
-        use prost_types::value::Kind::*;
-        use serde_json::Value::*;
-
-        prost_types::Value {
-            kind: Some(match json {
-                Null => NullValue(0),
-                Bool(v) => BoolValue(v),
-                Number(n) => NumberValue(n.as_f64().unwrap_or_else(|| {
-                    error!("error parsing JSON number: {}", n);
-                    0f64
-                })),
-                String(s) => StringValue(s),
-                Array(v) => ListValue(prost_types::ListValue {
-                    values: v.into_iter().map(Self::json_to_value).collect(),
-                }),
-                Object(v) => StructValue(Self::json_to_struct(v)),
-            }),
-        }
-    }
-
-    fn node(&self) -> Node {
-        let ip = std::env::var(INSTANCE_IP);
-        let ip = ip.as_deref().unwrap_or(DEFAULT_IP);
-        let pod_name = std::env::var(POD_NAME);
-        let pod_name = pod_name.as_deref().unwrap_or(EMPTY_STR);
-        let ns = std::env::var(POD_NAMESPACE);
-        let ns = ns.as_deref().unwrap_or(EMPTY_STR);
-        let node_name = std::env::var(NODE_NAME);
-        let node_name = node_name.as_deref().unwrap_or(EMPTY_STR);
-        let mut metadata = Self::build_struct([
-            (NAME, pod_name),
-            (NAMESPACE, ns),
-            (INSTANCE_IPS, ip),
-            (NODE_NAME, node_name),
-        ]);
-        metadata
-            .fields
-            .append(&mut Self::build_struct(self.config.proxy_metadata.clone()).fields);
-
-        // Lookup ISTIO_METAJSON_* environment variables and add them to the node metadata
-        for (key, val) in std::env::vars().filter(|(key, _)| key.starts_with(ISTIO_METAJSON_PREFIX))
-        {
-            if let Ok(v) = serde_json::from_str(&val) {
-                metadata.fields.insert(
-                    key.trim_start_matches(ISTIO_METAJSON_PREFIX).to_string(),
-                    Self::json_to_value(v),
-                );
-            } else {
-                error!("failed to parse {}={}", key, val);
-            }
-        }
-
-        Node {
-            id: format!("ztunnel~{ip}~{pod_name}.{ns}~{ns}.svc.cluster.local"),
-            metadata: Some(metadata),
-            ..Default::default()
-        }
+    fn is_initial_request_on_demand(r: &DeltaDiscoveryRequest) -> bool {
+        return !r.resource_names_subscribe.is_empty();
     }
 
     async fn run_internal(&mut self) -> Result<(), Error> {
         let (discovery_req_tx, mut discovery_req_rx) = mpsc::channel::<DeltaDiscoveryRequest>(100);
         // For each type in initial_watches we will send a request on connection to subscribe
-        let initial_requests = self.construct_initial_requests();
+        let initial_requests: Vec<DeltaDiscoveryRequest> = self
+            .config
+            .initial_requests
+            .iter()
+            .map(|e| {
+                let mut req = e.clone();
+                req.initial_resource_versions = self
+                    .state
+                    .known_resources
+                    .get(req.type_url.as_str())
+                    .map(|hs| {
+                        hs.iter()
+                            .map(|n| (n.to_owned(), "".to_string())) // Proto expects Name -> Version. We don't care about version
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                req
+            })
+            .collect();
+
+        let mut types_to_expect: HashSet<String> = initial_requests
+            .iter()
+            .filter(|e| !Self::is_initial_request_on_demand(e)) // is_empty implies not ondemand
+            .map(|e| e.type_url.clone())
+            .collect();
         let outbound = async_stream::stream! {
             for initial in initial_requests {
                 info!(resources=initial.initial_resource_versions.len(), type_url=initial.type_url, "sending initial request");
@@ -533,75 +591,28 @@ impl AdsClient {
         debug!("connected established");
 
         info!("Stream established");
-        // Create a oneshot channel to be notified as soon as we ACK the first XDS response
-        let (tx, initial_xds_rx) = oneshot::channel();
-        let mut initial_xds_tx = Some(tx);
-        let ready = mem::take(&mut self.block_ready);
-        tokio::spawn(async move {
-            match initial_xds_rx.await {
-                Ok(_) => drop(ready),
-                Err(_) => {
-                    debug!("sender was dropped before initial xds sync event was received");
-                }
-            }
-        });
-
         loop {
             tokio::select! {
                 _demand_event = self.state.demand.recv() => {
                     self.handle_demand_event(_demand_event, &discovery_req_tx).await?;
                 }
                 msg = response_stream.message() => {
-                    // TODO: If we have responses of different types (e.g. RBAC), we'll want to wait for
-                    // each type to receive a response before marking ready
-                    if let XdsSignal::Ack = self.handle_stream_event(msg?, &discovery_req_tx).await? {
-                        let val = mem::take(&mut initial_xds_tx);
-                        if let Some(tx) = val {
-                            if let Err(err) = tx.send(()) {
-                                warn!("initial xds sync signal send failed: {:?}", err)
+                    let msg = msg?;
+                    let mut received_type = None;
+                    if !types_to_expect.is_empty() {
+                        received_type = msg.as_ref().map(|e| e.type_url.clone());
+                    }
+                    if let XdsSignal::Ack = self.handle_stream_event(msg, &discovery_req_tx).await? {
+                        if let Some(received_type) = received_type {
+                            types_to_expect.remove(&received_type);
+                            if types_to_expect.is_empty() {
+                                mem::drop(mem::take(&mut self.block_ready));
                             }
                         }
                     };
                 }
             }
         }
-    }
-
-    fn construct_initial_requests(&mut self) -> Vec<DeltaDiscoveryRequest> {
-        let node = self.node();
-        let initial_requests: Vec<DeltaDiscoveryRequest> = self
-            .config
-            .initial_watches
-            .iter()
-            .map(|request_type| {
-                let irv: HashMap<String, String> = self
-                    .state
-                    .known_resources
-                    .get(request_type)
-                    .map(|hs| {
-                        hs.iter()
-                            .map(|n| (n.to_owned(), "".to_string())) // Proto expects Name -> Version. We don't care about version
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let (sub, unsub) = if self.config.on_demand {
-                    // XDS doesn't have a way to subscribe to zero resources. We workaround this by subscribing and unsubscribing
-                    // in one event, effectively giving us "subscribe to nothing".
-                    (vec!["*".to_string()], vec!["*".to_string()])
-                } else {
-                    (vec![], vec![])
-                };
-                DeltaDiscoveryRequest {
-                    type_url: request_type.to_owned(),
-                    node: Some(node.clone()),
-                    initial_resource_versions: irv,
-                    resource_names_subscribe: sub,
-                    resource_names_unsubscribe: unsub,
-                    ..Default::default()
-                }
-            })
-            .collect();
-        initial_requests
     }
 
     async fn handle_stream_event(
@@ -706,13 +717,14 @@ impl<T: prost::Message> XdsUpdate<T> {
 }
 
 fn decode_proto<T: prost::Message + Default>(
-    resource: ProtoResource,
+    resource: &ProtoResource,
 ) -> Result<XdsResource<T>, AdsError> {
-    let name = resource.name;
+    let name = resource.name.clone();
     resource
         .resource
+        .as_ref()
         .ok_or(AdsError::MissingResource())
-        .and_then(|res| <T>::decode(&*res.value).map_err(AdsError::Decode))
+        .and_then(|res| <T>::decode(&res.value[..]).map_err(AdsError::Decode))
         .map(|r| XdsResource { name, resource: r })
 }
 
@@ -873,7 +885,7 @@ mod tests {
         // JSON map
         let mut v = serde_json::json!({ "app": "foo", "version": "v1" });
         assert_eq!(
-            AdsClient::json_to_value(v).kind.unwrap(),
+            Config::json_to_value(v).kind.unwrap(),
             StructValue(prost_types::Struct {
                 fields: vec![
                     (
@@ -897,7 +909,7 @@ mod tests {
         // JSON array
         v = serde_json::json!(["foo", "bar"]);
         assert_eq!(
-            AdsClient::json_to_value(v).kind.unwrap(),
+            Config::json_to_value(v).kind.unwrap(),
             ListValue(prost_types::ListValue {
                 values: vec![
                     prost_types::Value {
@@ -912,14 +924,14 @@ mod tests {
 
         // JSON bool
         v = serde_json::json!(true);
-        assert_eq!(AdsClient::json_to_value(v).kind.unwrap(), BoolValue(true));
+        assert_eq!(Config::json_to_value(v).kind.unwrap(), BoolValue(true));
 
         // JSON Number
         v = serde_json::json!(1);
-        assert_eq!(AdsClient::json_to_value(v).kind.unwrap(), NumberValue(1f64));
+        assert_eq!(Config::json_to_value(v).kind.unwrap(), NumberValue(1f64));
 
         // JSON null
         v = serde_json::json!(());
-        assert_eq!(AdsClient::json_to_value(v).kind.unwrap(), NullValue(0));
+        assert_eq!(Config::json_to_value(v).kind.unwrap(), NullValue(0));
     }
 }
