@@ -354,8 +354,8 @@ impl Config {
         }
     }
 
-    pub fn build(self, metrics: Metrics, block_ready: readiness::BlockReady) -> AdsClient {
-        AdsClient::new(self, metrics, Some(block_ready))
+    pub fn build(self, metrics: Metrics, block_ready: tokio::sync::watch::Sender<()>) -> AdsClient {
+        AdsClient::new(self, metrics, block_ready)
     }
 }
 
@@ -375,7 +375,7 @@ pub struct AdsClient {
     state: State,
 
     pub(crate) metrics: Metrics,
-    block_ready: Option<readiness::BlockReady>,
+    block_ready: Option<tokio::sync::watch::Sender<()>>,
 
     connection_id: u32,
     types_to_expect: HashSet<String>,
@@ -434,7 +434,7 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
 
 impl AdsClient {
-    fn new(config: Config, metrics: Metrics, block_ready: Option<readiness::BlockReady>) -> Self {
+    fn new(config: Config, metrics: Metrics, block_ready: tokio::sync::watch::Sender<()>) -> Self {
         let (tx, rx) = mpsc::channel(100);
         let state = State {
             known_resources: Default::default(),
@@ -452,7 +452,7 @@ impl AdsClient {
             config: config,
             state: state,
             metrics: metrics,
-            block_ready: block_ready,
+            block_ready: Some(block_ready),
             connection_id: 0,
             types_to_expect: types_to_expect,
         }

@@ -620,7 +620,7 @@ impl ProxyStateManager {
     pub async fn new(
         config: config::Config,
         metrics: Metrics,
-        awaiting_ready: readiness::BlockReady,
+        awaiting_ready: tokio::sync::watch::Sender<()>,
         cert_manager: Arc<SecretManager>,
     ) -> anyhow::Result<ProxyStateManager> {
         let cert_fetcher = cert_fetcher::new(&config, cert_manager);

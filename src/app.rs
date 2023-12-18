@@ -97,14 +97,17 @@ pub async fn build_with_cert(
     // Run the metrics sever in the current tokio worker pool.
     metrics_server.spawn();
 
+    let (xds_tx, xds_rx) = tokio::sync::watch::channel(());
+
     // Create the manager that updates proxy state from XDS.
-    let state_mgr = ProxyStateManager::new(
-        config.clone(),
-        xds_metrics,
-        state_mgr_task,
-        cert_manager.clone(),
-    )
-    .await?;
+    let state_mgr =
+        ProxyStateManager::new(config.clone(), xds_metrics, xds_tx, cert_manager.clone()).await?;
+    let mut xds_rx_for_task = xds_rx.clone();
+    tokio::spawn(async move {
+        xds_rx_for_task.changed().await;
+        std::mem::drop(state_mgr_task);
+    });
+
     let state = state_mgr.state();
 
     // Create and start the admin server.
@@ -137,9 +140,11 @@ pub async fn build_with_cert(
         let addresses = proxy.addresses();
 
         // Run the HBONE proxy in the data plane worker pool.
+        let mut xds_rx_for_proxy = xds_rx.clone();
         data_plane_pool.send(DataPlaneTask {
             block_shutdown: true,
             fut: Box::pin(async move {
+                xds_rx_for_proxy.changed().await;
                 proxy.run().in_current_span().await;
                 Ok(())
             }),
@@ -165,9 +170,11 @@ pub async fn build_with_cert(
         let address = dns_proxy.address();
 
         // Run the DNS proxy in the data plane worker pool.
+        let mut xds_rx_for_dns_proxy = xds_rx.clone();
         data_plane_pool.send(DataPlaneTask {
             block_shutdown: true,
             fut: Box::pin(async move {
+                xds_rx_for_dns_proxy.changed().await;
                 dns_proxy.run().in_current_span().await;
                 Ok(())
             }),
