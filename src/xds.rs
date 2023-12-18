@@ -81,10 +81,16 @@ pub enum Error {
 }
 
 /// Updates the [ProxyState] from XDS.
+/// All state updates code goes in ProxyStateUpdaterInner, that takes state as a parameter.
+#[derive(Clone)]
+struct ProxyStateUpdaterInner {
+    cert_fetcher: Arc<dyn CertFetcher>,
+}
+
 #[derive(Clone)]
 pub struct ProxyStateUpdater {
     state: Arc<RwLock<ProxyState>>,
-    cert_fetcher: Arc<dyn CertFetcher>,
+    updater: ProxyStateUpdaterInner,
 }
 
 impl ProxyStateUpdater {
@@ -92,23 +98,24 @@ impl ProxyStateUpdater {
     pub fn new(state: Arc<RwLock<ProxyState>>, cert_fetcher: Arc<dyn CertFetcher>) -> Self {
         Self {
             state,
-            cert_fetcher,
+            updater: ProxyStateUpdaterInner { cert_fetcher },
         }
     }
-
     /// Creates a new updater that does not prefetch workload certs.
     pub fn new_no_fetch(state: Arc<RwLock<ProxyState>>) -> Self {
         Self::new(state, Arc::new(NoCertFetcher()))
     }
+}
 
-    pub fn insert_workload(&self, w: XdsWorkload) -> anyhow::Result<()> {
+impl ProxyStateUpdaterInner {
+    pub fn insert_workload(&self, state: &mut ProxyState, w: XdsWorkload) -> anyhow::Result<()> {
         debug!("handling insert {}", w.uid);
 
         // Convert the workload.
         let workload = Workload::try_from(&w)?;
 
         // First, remove the entry entirely to make sure things are cleaned up properly.
-        self.remove(&w.uid);
+        self.remove(state, &w.uid);
 
         // Unhealthy workloads are always inserted, as we may get or receive traffic to them.
         // But we shouldn't include them in load balancing we do to Services.
@@ -122,7 +129,6 @@ impl ProxyStateUpdater {
         self.cert_fetcher.prefetch_cert(&workload);
 
         // Lock and upstate the stores.
-        let mut state = self.state.write().unwrap();
         state.workloads.insert(workload)?;
         while let Some(endpoint) = endpoints.pop() {
             state.services.insert_endpoint(endpoint);
@@ -131,9 +137,7 @@ impl ProxyStateUpdater {
         Ok(())
     }
 
-    pub fn remove(&self, xds_name: &String) {
-        let mut state = self.state.write().unwrap();
-
+    pub fn remove(&self, state: &mut ProxyState, xds_name: &String) {
         // remove workload by UID; if xds_name is a service then this will no-op
         if let Some(prev) = state.workloads.remove(xds_name) {
             // Also remove service endpoints for the workload.
@@ -179,19 +183,20 @@ impl ProxyStateUpdater {
         }
     }
 
-    pub fn insert_address(&self, a: XdsAddress) -> anyhow::Result<()> {
+    pub fn insert_address(&self, state: &mut ProxyState, a: XdsAddress) -> anyhow::Result<()> {
         match a.r#type {
-            Some(XdsType::Workload(w)) => self.insert_workload(w),
-            Some(XdsType::Service(s)) => self.insert_service(s),
+            Some(XdsType::Workload(w)) => self.insert_workload(state, w),
+            Some(XdsType::Service(s)) => self.insert_service(state, s),
             _ => Err(anyhow::anyhow!("unknown address type")),
         }
     }
 
-    pub fn insert_service(&self, service: XdsService) -> anyhow::Result<()> {
+    pub fn insert_service(
+        &self,
+        state: &mut ProxyState,
+        service: XdsService,
+    ) -> anyhow::Result<()> {
         let mut service = Service::try_from(&service)?;
-
-        // Lock the store.
-        let mut state = self.state.write().unwrap();
 
         // If the service already exists, add existing endpoints into the new service.
         if let Some(prev) = state
@@ -207,31 +212,34 @@ impl ProxyStateUpdater {
         Ok(())
     }
 
-    pub fn insert_authorization(&self, r: XdsAuthorization) -> anyhow::Result<()> {
+    pub fn insert_authorization(
+        &self,
+        state: &mut ProxyState,
+        r: XdsAuthorization,
+    ) -> anyhow::Result<()> {
         info!("handling RBAC update {}", r.name);
 
         let rbac = rbac::Authorization::try_from(&r)?;
         trace!("insert policy {}", serde_json::to_string(&rbac)?);
-        let mut state = self.state.write().unwrap();
         state.policies.insert(rbac);
         Ok(())
     }
 
-    pub fn remove_authorization(&self, name: String) {
+    pub fn remove_authorization(&self, state: &mut ProxyState, name: String) {
         info!("handling RBAC delete {}", name);
-        let mut state = self.state.write().unwrap();
         state.policies.remove(name);
     }
 }
 
 impl Handler<XdsWorkload> for ProxyStateUpdater {
     fn handle(&self, updates: Vec<XdsUpdate<XdsWorkload>>) -> Result<(), Vec<RejectedConfig>> {
-        let handle = |res: XdsUpdate<XdsWorkload>| {
+        let mut state = self.state.write().unwrap();
+        let handle = move |res: XdsUpdate<XdsWorkload>| {
             match res {
-                XdsUpdate::Update(w) => self.insert_workload(w.resource)?,
+                XdsUpdate::Update(w) => self.updater.insert_workload(&mut state, w.resource)?,
                 XdsUpdate::Remove(name) => {
                     debug!("handling delete {}", name);
-                    self.remove(&name)
+                    self.updater.remove(&mut state, &name)
                 }
             }
             Ok(())
@@ -242,12 +250,13 @@ impl Handler<XdsWorkload> for ProxyStateUpdater {
 
 impl Handler<XdsAddress> for ProxyStateUpdater {
     fn handle(&self, updates: Vec<XdsUpdate<XdsAddress>>) -> Result<(), Vec<RejectedConfig>> {
-        let handle = |res: XdsUpdate<XdsAddress>| {
+        let mut state = self.state.write().unwrap();
+        let handle = move |res: XdsUpdate<XdsAddress>| {
             match res {
-                XdsUpdate::Update(w) => self.insert_address(w.resource)?,
+                XdsUpdate::Update(w) => self.updater.insert_address(&mut state, w.resource)?,
                 XdsUpdate::Remove(name) => {
                     debug!("handling delete {}", name);
-                    self.remove(&name)
+                    self.updater.remove(&mut state, &name)
                 }
             }
             Ok(())
@@ -302,10 +311,13 @@ impl Handler<XdsAuthorization> for ProxyStateUpdater {
     }
 
     fn handle(&self, updates: Vec<XdsUpdate<XdsAuthorization>>) -> Result<(), Vec<RejectedConfig>> {
-        let handle = |res: XdsUpdate<XdsAuthorization>| {
+        let mut state = self.state.write().unwrap();
+        let handle = move |res: XdsUpdate<XdsAuthorization>| {
             match res {
-                XdsUpdate::Update(w) => self.insert_authorization(w.resource)?,
-                XdsUpdate::Remove(name) => self.remove_authorization(name),
+                XdsUpdate::Update(w) => {
+                    self.updater.insert_authorization(&mut state, w.resource)?
+                }
+                XdsUpdate::Remove(name) => self.updater.remove_authorization(&mut state, name),
             }
             Ok(())
         };
