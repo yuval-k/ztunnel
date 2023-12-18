@@ -355,20 +355,7 @@ impl Config {
     }
 
     pub fn build(self, metrics: Metrics, block_ready: readiness::BlockReady) -> AdsClient {
-        let (tx, rx) = mpsc::channel(100);
-        let state = State {
-            known_resources: Default::default(),
-            pending: Default::default(),
-            demand: rx,
-            demand_tx: tx,
-        };
-        AdsClient {
-            config: self,
-            metrics,
-            state,
-            block_ready: Some(block_ready),
-            connection_id: 0,
-        }
+        AdsClient::new(self, metrics, Some(block_ready))
     }
 }
 
@@ -391,6 +378,7 @@ pub struct AdsClient {
     block_ready: Option<readiness::BlockReady>,
 
     connection_id: u32,
+    types_to_expect: HashSet<String>,
 }
 
 /// Demanded allows awaiting for an on-demand XDS resource
@@ -446,6 +434,29 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
 
 impl AdsClient {
+    fn new(config: Config, metrics: Metrics, block_ready: Option<readiness::BlockReady>) -> Self {
+        let (tx, rx) = mpsc::channel(100);
+        let state = State {
+            known_resources: Default::default(),
+            pending: Default::default(),
+            demand: rx,
+            demand_tx: tx,
+        };
+        let types_to_expect: HashSet<String> = config
+            .initial_requests
+            .iter()
+            .filter(|e| !Self::is_initial_request_on_demand(e)) // is_empty implies not ondemand
+            .map(|e| e.type_url.clone())
+            .collect();
+        AdsClient {
+            config: config,
+            state: state,
+            metrics: metrics,
+            block_ready: block_ready,
+            connection_id: 0,
+            types_to_expect: types_to_expect,
+        }
+    }
     /// demander returns a Demander instance which can be used to request resources on-demand
     pub fn demander(&self) -> Option<Demander> {
         if self.config.on_demand {
@@ -558,11 +569,6 @@ impl AdsClient {
             })
             .collect();
 
-        let mut types_to_expect: HashSet<String> = initial_requests
-            .iter()
-            .filter(|e| !Self::is_initial_request_on_demand(e)) // is_empty implies not ondemand
-            .map(|e| e.type_url.clone())
-            .collect();
         let outbound = async_stream::stream! {
             for initial in initial_requests {
                 info!(resources=initial.initial_resource_versions.len(), type_url=initial.type_url, "sending initial request");
@@ -599,13 +605,13 @@ impl AdsClient {
                 msg = response_stream.message() => {
                     let msg = msg?;
                     let mut received_type = None;
-                    if !types_to_expect.is_empty() {
+                    if !self.types_to_expect.is_empty() {
                         received_type = msg.as_ref().map(|e| e.type_url.clone());
                     }
                     if let XdsSignal::Ack = self.handle_stream_event(msg, &discovery_req_tx).await? {
                         if let Some(received_type) = received_type {
-                            types_to_expect.remove(&received_type);
-                            if types_to_expect.is_empty() {
+                            self.types_to_expect.remove(&received_type);
+                            if self.types_to_expect.is_empty() {
                                 mem::drop(mem::take(&mut self.block_ready));
                             }
                         }
