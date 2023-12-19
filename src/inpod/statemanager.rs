@@ -69,10 +69,17 @@ pub struct WorkloadProxyManagerState {
     snapshot_names: std::collections::HashSet<String>,
 
     inpod_config: InPodConfig,
+
+    cluster_id: String,
 }
 
 impl WorkloadProxyManagerState {
-    pub fn new(proxy_gen: ProxyFactory, inpod_config: InPodConfig, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        proxy_gen: ProxyFactory,
+        cluster_id: String,
+        inpod_config: InPodConfig,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         WorkloadProxyManagerState {
             proxy_gen,
             metrics,
@@ -83,6 +90,7 @@ impl WorkloadProxyManagerState {
             snapshot_received: false,
             snapshot_names: Default::default(),
             inpod_config,
+            cluster_id,
         }
     }
 
@@ -235,10 +243,18 @@ impl WorkloadProxyManagerState {
         let workload_netns_inode = netns.workload_inode();
         let (drain_tx, drain_rx) = drain::channel();
 
+        // this matches istio's generatePodUID
+        // TODO: we may want to use the pod's UUID here instead. if we want to do so we need to add it to WDS.
+        let workload_uid = workload_info
+            .pod_info
+            .as_ref()
+            .map(|pi| format!("{}//Pod/{}/{}", self.cluster_id, pi.namespace, pi.name));
+
         let proxies = self
             .proxy_gen
             .new_proxies_from_factory(
                 Some(drain_rx),
+                workload_uid,
                 Arc::from(self.inpod_config.socket_factory(netns)),
             )
             .await?;
@@ -353,7 +369,8 @@ mod tests {
         let mut mock_ipc = MockInPodConfig::default();
         expect_new_proxy(&mut mock_proxy_gen, &mut mock_ipc, 0);
 
-        let mut state = WorkloadProxyManagerState::new(mock_proxy_gen, mock_ipc, metrics());
+        let mut state =
+            WorkloadProxyManagerState::new(mock_proxy_gen, "".to_string(), mock_ipc, metrics());
         let data = workload_data(0);
         let ns = InpodNetns::new(Arc::new(workload_netns(10)), data.netns).unwrap();
         state.add_workload(data.info, ns).await.unwrap();
@@ -367,7 +384,8 @@ mod tests {
         expect_new_proxy(&mut mock_proxy_gen, &mut mock_ipc, 0);
 
         let m = metrics();
-        let mut state = WorkloadProxyManagerState::new(mock_proxy_gen, mock_ipc, m.clone());
+        let mut state =
+            WorkloadProxyManagerState::new(mock_proxy_gen, "".to_string(), mock_ipc, m.clone());
         let data = workload_data(0);
         let ns = InpodNetns::new(Arc::new(workload_netns(10)), data.netns).unwrap();
         state
@@ -388,7 +406,8 @@ mod tests {
         expect_new_proxy(&mut mock_proxy_gen, &mut mock_ipc, 0);
 
         let m = metrics();
-        let mut state = WorkloadProxyManagerState::new(mock_proxy_gen, mock_ipc, m.clone());
+        let mut state =
+            WorkloadProxyManagerState::new(mock_proxy_gen, "".to_string(), mock_ipc, m.clone());
         let data = workload_data(0);
         let ns = InpodNetns::new(Arc::new(workload_netns(10)), data.netns).unwrap();
         let ret = state.add_workload(data.info, ns.clone()).await;
@@ -407,7 +426,8 @@ mod tests {
         let mut mock_ipc = MockInPodConfig::default();
         expect_error_proxy(&mut mock_proxy_gen, &mut mock_ipc, 0);
 
-        let mut state = WorkloadProxyManagerState::new(mock_proxy_gen, mock_ipc, metrics());
+        let mut state =
+            WorkloadProxyManagerState::new(mock_proxy_gen, "".to_string(), mock_ipc, metrics());
         let data = workload_data(0);
         let ns = InpodNetns::new(Arc::new(workload_netns(10)), data.netns).unwrap();
         let ret = state.add_workload(data.info.clone(), ns.clone()).await;
@@ -436,7 +456,8 @@ mod tests {
             .times(..)
             .returning(move || ns.clone());
 
-        let mut state = WorkloadProxyManagerState::new(mock_proxy_gen, mock_ipc, metrics());
+        let mut state =
+            WorkloadProxyManagerState::new(mock_proxy_gen, "".to_string(), mock_ipc, metrics());
         let data = workload_data(0);
 
         //        let ns = InpodNetns::new(Arc::new(workload_netns(10)), data.netns).unwrap();
@@ -468,7 +489,8 @@ mod tests {
             .times(..)
             .returning(move || ns.clone());
         let m = metrics();
-        let mut state = WorkloadProxyManagerState::new(mock_proxy_gen, mock_ipc, m.clone());
+        let mut state =
+            WorkloadProxyManagerState::new(mock_proxy_gen, "".to_string(), mock_ipc, m.clone());
         let data = workload_data(0);
 
         let info = data.info.clone();
@@ -512,7 +534,8 @@ mod tests {
         expect_new_proxy_with_fd(&mut mock_proxy_gen, &mut mock_ipc, 0, Some(fd2.as_raw_fd()));
 
         let m = metrics();
-        let mut state = WorkloadProxyManagerState::new(mock_proxy_gen, mock_ipc, m.clone());
+        let mut state =
+            WorkloadProxyManagerState::new(mock_proxy_gen, "".to_string(), mock_ipc, m.clone());
         let data = workload_data(0);
         let info = data.info.clone();
 

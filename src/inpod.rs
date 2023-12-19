@@ -59,6 +59,7 @@ pub enum Error {
 #[derive(Debug, Clone)]
 struct WorkloadInfo {
     workload_uid: String,
+    pod_info: Option<istio::zds::PodInfo>,
 }
 #[derive(Debug)]
 pub struct WorkloadData {
@@ -91,7 +92,7 @@ pub fn init_and_new(
     admin_server.add_handler(metrics.admin_handler());
     let inpod_config = crate::inpod::InPodConfig::new(cfg)?;
 
-    let state_mgr = statemanager::WorkloadProxyManagerState::new(proxy_gen, inpod_config, metrics);
+    let state_mgr = statemanager::WorkloadProxyManagerState::new(proxy_gen,cfg.cluster_id.clone(), inpod_config, metrics);
 
     Ok(WorkloadProxyManager::new(
         cfg.inpod_uds.clone(),
@@ -224,6 +225,7 @@ pub(crate) mod tests {
             netns: workload_netns(i),
             info: WorkloadInfo {
                 workload_uid: uid(i),
+                pod_info: None,
             },
         }
     }

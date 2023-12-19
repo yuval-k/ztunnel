@@ -160,7 +160,7 @@ mod workload_processor_helpers {
                 let uid: String = a.uid;
                 Ok(WorkloadMessage::AddWorkload(WorkloadData {
                     netns: our_netns,
-                    info: WorkloadInfo { workload_uid: uid },
+                    info: WorkloadInfo { workload_uid: uid , pod_info: a.pod_info},
                 }))
             }
             (Payload::Add(_), None) => Err(anyhow::anyhow!("No control message")),

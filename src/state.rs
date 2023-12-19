@@ -237,7 +237,13 @@ impl DemandProxyState {
             debug!("destination workload not found {}", nw_addr);
             return false;
         };
-
+        self.assert_rbac_with_dest_workload(conn, &wl).await
+    }
+    pub async fn assert_rbac_with_dest_workload(
+        &self,
+        conn: &rbac::Connection,
+        wl: &Workload,
+    ) -> bool {
         let state = self.state.read().unwrap();
 
         // We can get policies from namespace, global, and workload...
