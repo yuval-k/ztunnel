@@ -732,17 +732,19 @@ where
     false
 }
 
-const IPV6_DISABLED_LO: &str = "/proc/sys/net/ipv6/conf/lo/disable_ipv6";
-
-fn read_sysctl(key: &str) -> io::Result<String> {
-    let mut file = File::open(key)?;
-    let mut data = String::new();
-    file.read_to_string(&mut data)?;
-    Ok(data.trim().to_string())
-}
-
 pub fn ipv6_disabled_on_localhost() -> io::Result<bool> {
-    read_sysctl(IPV6_DISABLED_LO).map(|s| s != "1")
+    // try to bind to ipv6 address
+    let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+    match std::net::TcpListener::bind(addr) {
+        Ok(_) => Ok(false),
+        Err(e) => {
+            match e.raw_os_error() {
+                Some(libc::EAFNOSUPPORT) => Ok(true), // ipv6 not available on localhost
+                Some(libc::EACCES) => Ok(true), // disabled by sysctl
+                _ => Err(e),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
